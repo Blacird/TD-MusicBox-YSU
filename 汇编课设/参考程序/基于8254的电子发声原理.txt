@@ -1,0 +1,94 @@
+; 8254定时器端口地址定义
+IOY0         EQU   06C0H
+MY8254_COUNT0 EQU  IOY0 + 00H   ; 8254计数器0端口地址
+MY8254_COUNT1 EQU  IOY0 + 02H   ; 8254计数器1端口地址
+MY8254_COUNT2 EQU  IOY0 + 04H   ; 8254计数器2端口地址
+MY8254_MODE   EQU  IOY0 + 06H   ; 8254控制寄存器端口地址
+
+; 堆栈段定义
+STACK1 SEGMENT STACK
+    DW 256 DUP(?)
+STACK1 ENDS
+
+; 数据段定义
+DATA SEGMENT
+    ; 频率表（Hz） - 控制音高
+    FREQ_LIST DW 371,495,495,495,624,556,495,556,624
+              DW 495,495,624,742,833,833,833,742,624
+              DW 624,495,556,495,556,624,495,416,416,371
+              DW 495,833,742,624,624,495,556,495,556,833
+              DW 742,624,624,742,833,990,742,624,624,495
+              DW 556,495,556,624,495,416,416,371,495,0   ; 0作为结束标志
+
+    ; 时间表（相对时长） - 控制节拍
+    TIME_LIST DB 4, 6, 2, 4, 4, 6, 2, 4, 4
+              DB 6, 2, 4, 4, 12, 1, 3, 6, 2
+              DB 4, 4, 6, 2, 4, 4, 6, 2, 4, 4
+              DB 12, 4, 6, 2, 4, 4, 6, 2, 4, 4
+              DB 6, 2, 4, 4, 12, 4, 6, 2, 4, 4
+              DB 6, 2, 4, 4, 6, 2, 4, 4, 12
+DATA ENDS
+
+; 代码段定义
+CODE SEGMENT
+    ASSUME CS:CODE, DS:DATA, SS:STACK1
+
+START:
+    ; 初始化数据段
+    MOV AX, DATA
+    MOV DS, AX
+
+    ; 初始化8254定时器（计数器0，方式3，二进制计数）
+    MOV DX, MY8254_MODE
+    MOV AL, 36H           ; 00110110B: 计数器0，先写低字节后写高字节，方式3，二进制计数
+    OUT DX, AL
+
+BEGIN:
+    ; 初始化指针
+    MOV SI, OFFSET FREQ_LIST  ; 频率表指针
+    MOV DI, OFFSET TIME_LIST  ; 时间表指针
+
+PLAY:
+    ; 计算计数初值：1MHz / 目标频率
+    MOV DX, 0FH           ; 输入时钟频率 = 1MHz = 0F4240H
+    MOV AX, 4240H
+    DIV WORD PTR [SI]     ; DX:AX / 频率值 = 计数初值
+    
+    ; 将计数初值写入计数器0（先低字节，后高字节）
+    MOV DX, MY8254_COUNT0
+    OUT DX, AL            ; 写入低字节
+    MOV AL, AH
+    OUT DX, AL            ; 写入高字节
+    
+    ; 根据时间表延时
+    MOV DL, [DI]          ; 获取当前音符的持续时间
+    CALL DALLY            ; 调用延时子程序
+    
+    ; 移动指针到下一个音符
+    ADD SI, 2             ; 频率表每个元素占2字节
+    INC DI                ; 时间表每个元素占1字节
+    
+    ; 检查是否到达曲末（频率值为0表示结束）
+    CMP WORD PTR [SI], 0
+    JE BEGIN              ; 循环播放
+    
+    JMP PLAY              ; 播放下一个音符
+
+; 延时子程序
+; 入口参数：DL = 延时倍数
+DALLY PROC
+D0:
+    MOV CX, 0010H         ; 外层循环计数
+D1:
+    MOV AX, 0F00H         ; 内层循环计数
+D2:
+    DEC AX
+    JNZ D2                ; 内层循环
+    LOOP D1               ; 外层循环
+    DEC DL
+    JNZ D0                ; 延时倍数循环
+    RET
+DALLY ENDP
+
+CODE ENDS
+    END START
