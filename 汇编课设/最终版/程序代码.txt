@@ -1,0 +1,509 @@
+; ********************************************************************************
+; 程序名称：8255+8254 按键触发歌曲播放+数码管显示程序
+; 硬件依赖：8255并行接口（数码管显示/按键扫描）、8254定时器（音频频率生成）
+; 功能说明：
+;  1.  按键0-2分别触发播放3首不同歌曲，按键3停止发声并恢复初始显示，按键4退出程序
+;  2.  数码管实时显示对应功能标识，播放歌曲时支持按键中断（触发其他功能）
+;  3.  8254计数器0工作在方式3，生成音频频率；8255端口A/B/C分别负责列扫描/段选/行状态读取
+; ********************************************************************************
+
+; ============================================
+; 8255 端口地址定义
+; ============================================
+MY8255_A     EQU 0600H       ; 8255端口A：数码管位选 / 按键列扫描输出
+MY8255_B     EQU 0602H       ; 8255端口B：数码管段选输出
+MY8255_C     EQU 0604H       ; 8255端口C：按键行状态输入
+MY8255_CON   EQU 0606H       ; 8255控制寄存器：工作模式配置
+
+; ============================================
+; 8254 定时器端口地址定义
+; ============================================
+IOY0         EQU   06C0H     ; 8254基地址
+MY8254_COUNT0 EQU  IOY0 + 00H; 8254计数器0：音频频率生成（核心计数端口）
+MY8254_COUNT1 EQU  IOY0 + 02H; 8254计数器1：备用
+MY8254_COUNT2 EQU  IOY0 + 04H; 8254计数器2：备用
+MY8254_MODE   EQU  IOY0 + 06H; 8254控制寄存器：计数器工作模式配置
+
+; ============================================
+; 堆栈段定义
+; ============================================
+SSTACK SEGMENT STACK
+    DW 16 DUP(?)             ; 定义16字堆栈空间，满足程序寄存器压栈需求
+SSTACK ENDS
+
+; ============================================
+; 数据段定义
+; 包含：数码管显示码表、3首歌曲频率表、对应节拍时间表
+; ============================================
+DATA SEGMENT
+    ; 数码管显示码表（共阴）：0-F(0-15)、自定义字符(16-25)、空白(26)
+    DTABLE DB 3FH, 06H, 5BH, 4FH, 66H, 6DH, 7DH, 07H
+           DB 7FH, 6FH, 77H, 7CH, 39H, 5EH, 79H, 71H
+           DB 73H,38H,77H,3EH,39H,37H,7CH,5EH,76H,38H
+           DB 00H
+           
+    ; 歌曲1频率表：0为播放结束标志
+    FREQ_LIST1 DW 371,495,495,495,624,556,495,556,624
+              DW 495,495,624,742,833,833,833,742,624
+              DW 624,495,556,495,556,624,495,416,416,371
+              DW 495,833,742,624,624,495,556,495,556,833
+              DW 742,624,624,742,833,990,742,624,624,495
+              DW 556,495,556,624,495,416,416,371,495,0
+
+    ; 歌曲1节拍时间表：对应FREQ_LIST1，控制音符持续时长
+    TIME_LIST1 DB 4, 6, 2, 4, 4, 6, 2, 4, 4
+              DB 6, 2, 4, 4, 12, 1, 3, 6, 2
+              DB 4, 4, 6, 2, 4, 4, 6, 2, 4, 4
+              DB 12, 4, 6, 2, 4, 4, 6, 2, 4, 4
+              DB 6, 2, 4, 4, 12, 4, 6, 2, 4, 4
+              DB 6, 2, 4, 4, 6, 2, 4, 4, 12
+              
+    ; 歌曲2频率表（两只老虎）：0为播放结束标志
+    FREQ_LIST2 DW 262,294,330,262,262,294,330,262
+                DW 330,349,392,392,330,349,392,392
+                DW 392,440,392,349,330,262,392,440
+                DW 392,349,330,262,294,196,262,262
+                DW 294,196,262,0
+                 
+    ; 歌曲2节拍时间表：对应FREQ_LIST2，控制音符持续时长
+    TIME_LIST2 DB 2,2,2,2,2,2,2,2
+               DB 2,2,3,2,2,2
+               DB 4,2,2,2,2,2,2,2
+               DB 2,2,2,2,2,2,2,2
+               DB 3,2,2
+
+    ; 歌曲3频率表：0为播放结束标志
+    FREQ_LIST4 DW 784,659,698,784,659,698
+               DW 784,392,440,494,524,587,659,698
+               DW 659,524,587,659,330,349
+               DW 392,440,392,349,392,330,349,392
+               DW 349,440,392,349,330,294
+               DW 330,294,262,294,330,349,392,440
+               DW 349,440,392,440,494,524,392,440,494,524
+               DW 587,659,698,784,0
+            
+    ; 歌曲3节拍时间表：对应FREQ_LIST4，控制音符持续时长
+    TIME_LIST4 DB 4,2,2,4,2,2,2,2,2,2,2,2,2,2
+               DB 4,2,2,4,2,2,2,2,2,2,2,2,2,2
+               DB 4,2,2,4,2,2,2,2,2,2,2,2,2,2
+               DB 4,2,2,4,2,2,2,2,2,2,2,2,2,2
+DATA ENDS
+
+; ============================================
+; 代码段定义
+; 包含：核心子程序（歌曲播放、延时、按键扫描）、主程序逻辑
+; ============================================
+CODE SEGMENT
+    ASSUME CS:CODE, DS:DATA
+
+; ============================================
+; 歌曲播放核心子程序：PLAYSONG
+; 入口参数：SI = 对应歌曲频率表首地址
+;           DI = 对应歌曲时间表首地址
+; 功能说明：读取频率/时间数据，通过8254生成音频，支持按键中断播放
+; 出口参数：无（播放完毕或按键中断后返回）
+; ============================================
+PLAYSONG PROC
+    PUSH AX          ; 保存寄存器现场，避免破坏主程序环境
+    PUSH BX
+    PUSH CX
+    PUSH DX
+    PUSH SI
+    PUSH DI
+
+PLAY:
+    ; 计算8254计数初值：1MHz / 目标频率（DX:AX = 0F4240H = 1000000）
+    MOV DX, 0FH
+    MOV AX, 4240H
+    DIV WORD PTR [SI] ; 商（计数初值）存入AX，余数存入DX
+
+    ; 将计数初值写入8254计数器0（先低字节，后高字节）
+    MOV DX, MY8254_COUNT0
+    OUT DX, AL        ; 写入低字节
+    MOV AL, AH
+    OUT DX, AL        ; 写入高字节
+
+    ; 读取节拍时间并执行专用延时（含按键检测）
+    MOV DL, [DI]
+    CALL DALLY_SONG
+
+    CMP BH, 01H       ; 检测按键标记（BH=1表示有按键按下）
+    JE  KEY_SCAN_FROM_SONG ; 有按键则跳转至公共按键处理入口
+
+    ; 移动指针至下一个音符
+    ADD SI, 2         ; 频率表元素占2字节
+    INC DI            ; 时间表元素占1字节
+
+    CMP WORD PTR [SI], 0 ; 检测是否到达歌曲末尾（频率为0）
+    JE PLAY_END       ; 播放完毕，跳转至结束处理
+
+    JMP PLAY          ; 循环播放下一个音符
+
+PLAY_END:
+    ; 关闭8254发声（计数器0写入0初值）
+    MOV DX, MY8254_COUNT0
+    MOV AL, 00H
+    OUT DX, AL
+    MOV AL, 00H
+    OUT DX, AL
+
+    POP DI            ; 恢复寄存器现场
+    POP SI
+    POP DX
+    POP CX
+    POP BX
+    POP AX
+    RET
+PLAYSONG ENDP
+
+; ============================================
+; 歌曲专用延时子程序：DALLY_SONG
+; 功能说明：实现音符时长延时，同时检测按键状态，设置按键标记
+; 出口参数：BH = 0（无按键）/ 1（有按键）
+; ============================================
+DALLY_SONG PROC
+    MOV BH, 00H       ; 初始化按键标记（无按键）
+D0:
+    MOV CX, 0009H     ; 外层循环计数
+D1:
+    MOV AX, 00F0H     ; 内层循环计数
+D2:
+    DEC AX
+    JNZ D2            ; 内层延时循环
+
+    CALL CCSCAN       ; 调用按键扫描子程序
+    JNZ DALLY_EXIT_KEY; 有按键则跳转设置标记
+
+    CALL DIS          ; 延时期间刷新数码管显示
+
+    LOOP D1           ; 外层延时循环
+    DEC DL
+    JNZ D0            ; 按节拍倍数循环延时
+    JMP DALLY_EXIT_NORMAL ; 正常延时结束，直接退出
+
+DALLY_EXIT_KEY:
+    MOV BH, 01H       ; 设置按键标记（有按键）
+DALLY_EXIT_NORMAL:
+    RET
+DALLY_SONG ENDP
+
+; ============================================
+; 歌曲播放中按键中断入口：KEY_SCAN_FROM_SONG
+; 功能说明：终止当前播放，恢复寄存器，跳转至按键处理逻辑
+; ============================================
+KEY_SCAN_FROM_SONG:
+    ; 终止8254发声
+    MOV DX, MY8254_COUNT0
+    MOV AL, 00H
+    OUT DX, AL
+    MOV AL, 00H
+    OUT DX, AL
+
+    ; 恢复寄存器现场（与PLAYSONG压栈顺序一致）
+    POP DI
+    POP SI
+    POP DX
+    POP CX
+    POP BX
+    POP AX
+
+    JMP INK2          ; 跳转至按键处理核心逻辑
+; ============================================
+; 主程序：初始化 + 主循环 + 按键处理
+; ============================================
+START:
+    MOV AX, DATA
+    MOV DS, AX        ; 初始化数据段寄存器
+
+    ; 初始化数码管显示缓冲区（初始显示：1 2 3 A U 空白）
+    MENU:MOV SI, 3000H
+    MOV AL, 01
+    MOV [SI], AL
+    MOV AL, 02
+    MOV [SI+1], AL
+    MOV AL, 03
+    MOV [SI+2], AL
+    MOV AL, 18
+    MOV [SI+3], AL
+    MOV AL, 19
+    MOV [SI+4], AL
+    MOV AL, 26
+    MOV [SI+5], AL
+    MOV DI, 3005H
+
+    ; 初始化8255：端口A输出、端口B输出、端口C输入（模式0）
+    MOV DX, MY8255_CON
+    MOV AL, 81H
+    OUT DX, AL
+
+    ; 初始化8254计数器0：方式3（方波输出）、先低后高字节、二进制计数
+    MOV DX, MY8254_MODE
+    MOV AL, 36H
+    OUT DX, AL
+
+; 主循环：持续刷新显示 + 检测按键
+MAIN_LOOP:
+    CALL DIS
+    CALL CLEAR
+    CALL CCSCAN
+    JNZ INK1          ; 检测到按键，跳转至消抖处理
+    JMP MAIN_LOOP
+
+; 按键消抖处理：二次检测确认按键有效
+INK1:
+    CALL DIS
+    CALL DALLY
+    CALL DALLY
+    CALL CLEAR
+    CALL CCSCAN
+    JNZ INK2          ; 消抖后确认有按键，跳转至按键扫描
+    JMP MAIN_LOOP
+
+; 按键扫描核心逻辑：仅检测L1行（按键0-4）
+INK2:
+    ; 扫描列0（按键0/4）
+    MOV AL, 0FEH
+    MOV DX, MY8255_A
+    OUT DX, AL
+    MOV DX, MY8255_C
+    IN AL, DX
+    TEST AL, 01H
+    JZ  KEY_0         ; L1行有效，跳转按键0处理
+    TEST AL,02H
+    JZ  KEY_4         ; L2行有效，跳转按键4处理
+
+    ; 扫描列1（按键1）
+    MOV AL, 0FDH
+    MOV DX, MY8255_A
+    OUT DX, AL
+    MOV DX, MY8255_C
+    IN AL, DX
+    TEST AL, 01H
+    JZ  KEY_1
+
+    ; 扫描列2（按键2）
+    MOV AL, 0FBH
+    MOV DX, MY8255_A
+    OUT DX, AL
+    MOV DX, MY8255_C
+    IN AL, DX
+    TEST AL, 01H
+    JZ  KEY_2
+
+    ; 扫描列3（按键3）
+    MOV AL, 0F7H
+    MOV DX, MY8255_A
+    OUT DX, AL
+    MOV DX, MY8255_C
+    IN AL, DX
+    TEST AL, 01H
+    JNZ SKIP_KEY3
+    JMP  KEY_3
+SKIP_KEY3:
+
+    JMP KEY_ERROR     ; 非0-4按键，跳转至错误处理
+
+; 按键0处理：更新显示 + 播放歌曲1
+KEY_0:
+    CALL WAIT_RELEASE_SIMPLE ; 等待按键释放，避免重复触发
+    ; 更新数码管显示缓冲区
+    MOV SI, 3000H
+    MOV AL, 01
+    MOV [SI], AL
+    MOV AL, 24
+    MOV [SI+1], AL
+    MOV AL, 25
+    MOV [SI+2], AL
+    MOV AL, 05
+    MOV [SI+3], AL
+    MOV AL, 00
+    MOV [SI+4], AL
+    MOV AL, 21
+    MOV [SI+5], AL
+    ; 设置歌曲1参数并播放
+    MOV SI, OFFSET FREQ_LIST1
+    MOV DI, OFFSET TIME_LIST1
+    CALL PLAYSONG
+    JMP KEY_ERROR
+
+; 按键4处理：退出程序
+KEY_4:
+    CALL WAIT_RELEASE_SIMPLE
+    MOV AH, 4CH
+    INT 21H           ; 调用DOS中断，退出程序
+
+; 按键1处理：更新显示 + 播放歌曲2
+KEY_1:
+    CALL WAIT_RELEASE_SIMPLE
+    ; 更新数码管显示缓冲区
+    MOV SI, 3000H
+    MOV AL, 02
+    MOV [SI], AL
+    MOV AL, 25
+    MOV [SI+1], AL
+    MOV AL, 18
+    MOV [SI+2], AL
+    MOV AL, 00
+    MOV [SI+3], AL
+    MOV AL, 24
+    MOV [SI+4], AL
+    MOV AL, 19
+    MOV [SI+5], AL
+    ; 设置歌曲2参数并播放
+    MOV SI, OFFSET FREQ_LIST2
+    MOV DI, OFFSET TIME_LIST2
+    CALL PLAYSONG
+    JMP KEY_ERROR
+
+; 按键2处理：更新显示 + 播放歌曲3
+KEY_2:
+    CALL WAIT_RELEASE_SIMPLE
+    ; 更新数码管显示缓冲区
+    MOV SI, 3000H
+    MOV AL, 03
+    MOV [SI], AL
+    MOV AL, 20
+    MOV [SI+1], AL
+    MOV AL, 18
+    MOV [SI+2], AL
+    MOV AL, 21
+    MOV [SI+3], AL
+    MOV [SI+5], AL
+    MOV AL, 00
+    MOV [SI+4], AL
+    ; 设置歌曲3参数并播放
+    MOV SI, OFFSET FREQ_LIST4
+    MOV DI, OFFSET TIME_LIST4
+    CALL PLAYSONG
+    JMP KEY_ERROR
+
+; 按键3处理：停止发声 + 恢复初始显示
+KEY_3:
+    ; 关闭8254发声
+    MOV DX, MY8254_COUNT0
+    MOV AL, 00H
+    OUT DX, AL
+    MOV AL, 00H
+    OUT DX, AL
+    JMP  MENU         ; 跳转至初始显示初始化
+
+; ============================================
+; 等待按键释放子程序：WAIT_RELEASE_SIMPLE
+; 功能说明：循环检测按键状态，直至按键释放
+; ============================================
+WAIT_RELEASE_SIMPLE PROC
+WAIT_LOOP:
+    CALL DIS
+    CALL CLEAR
+    CALL CCSCAN
+    JNZ WAIT_LOOP     ; 按键未释放，持续循环
+    RET
+WAIT_RELEASE_SIMPLE ENDP
+
+; 无效按键处理：返回主循环
+KEY_ERROR:
+    JMP MAIN_LOOP
+
+; ============================================
+; 按键扫描子程序：CCSCAN
+; 功能说明：检测是否有按键按下（全行扫描）
+; 出口参数：AL ≠ 0 表示有按键，AL = 0 表示无按键
+; ============================================
+CCSCAN PROC
+    PUSH DX
+    MOV AL, 00H
+    MOV DX, MY8255_A
+    OUT DX, AL        ; 所有列置低电平
+    MOV DX, MY8255_C
+    IN AL, DX         ; 读取行状态
+    NOT AL            ; 取反（高电平表示有按键）
+    AND AL, 0FH       ; 仅保留低4位（4行状态）
+    POP DX
+    RET
+CCSCAN ENDP
+
+; ============================================
+; 数码管清屏子程序：CLEAR
+; 功能说明：关闭所有数码管显示
+; ============================================
+CLEAR PROC
+    MOV DX, MY8255_B
+    MOV AL, 00H
+    OUT DX, AL        ; 段选置0，关闭显示
+    RET
+CLEAR ENDP
+
+; ============================================
+; 数码管显示子程序：DIS
+; 功能说明：扫描显示6位数码管（从高位到低位）
+; ============================================
+DIS PROC
+    PUSH AX
+    PUSH DX
+    PUSH BX
+    PUSH SI
+    MOV SI, 3005H     ; 显示缓冲区末地址（对应最高位数码管）
+    MOV DL, 0DFH      ; 位选初始值（对应最高位）
+    MOV AL, DL
+AGAIN:
+    PUSH DX
+    MOV DX, MY8255_A
+    OUT DX, AL        ; 输出位选信号
+    MOV AL, [SI]
+    MOV BX, OFFSET DTABLE
+    AND AX, 00FFH
+    ADD BX, AX
+    MOV AL, [BX]
+    MOV DX, MY8255_B
+    OUT DX, AL        ; 输出段选信号
+    CALL DALLY        ; 保持显示一段时间
+    DEC SI            ; 移动至下一个显示缓冲区地址
+    POP DX
+    MOV AL, DL
+    TEST AL, 01H
+    JZ DIS_END        ; 所有位显示完毕，退出
+    ROR AL, 1         ; 位选信号右移，切换至下一位
+    MOV DL, AL
+    JMP AGAIN
+DIS_END:
+    POP SI
+    POP BX
+    POP DX
+    POP AX
+    RET
+DIS ENDP
+
+; ============================================
+; 通用延时子程序：DALLY
+; 功能说明：提供基础延时，用于数码管显示保持
+; ============================================
+DALLY PROC
+    PUSH CX
+    MOV CX, 0006H     ; 外层循环计数
+DELAY_OUTER:
+    MOV AX, 009FH     ; 内层循环计数
+DELAY_INNER:
+    DEC AX
+    JNZ DELAY_INNER
+    LOOP DELAY_OUTER
+    POP CX
+    RET
+DALLY ENDP
+
+; ============================================
+; 显示缓冲区写入子程序：PUTBUF
+; 功能说明：将数据写入显示缓冲区，支持循环缓存
+; ============================================
+PUTBUF PROC
+    MOV SI, DI
+    MOV [SI], AL
+    DEC DI
+    CMP DI, 2FFFH
+    JNZ EXIT_PUTBUF
+    MOV DI, 3005H     ; 缓冲区溢出，恢复至初始地址
+EXIT_PUTBUF:
+    RET
+PUTBUF ENDP
+
+CODE ENDS
+    END START
